@@ -423,7 +423,6 @@ discover() {
         info "Stack $name already exists; updating template and uploading script..."
         stack_op "update" "$name" "$template" "$dry" "$region" || { err "Update failed"; return 1; }
     else
-        info "deploying stack: $name"
         stack_op "create" "$name" "$template" "$dry" "$region" || { err "Deploy failed"; return 1; }
     fi
 

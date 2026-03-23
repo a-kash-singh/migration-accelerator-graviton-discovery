@@ -93,6 +93,37 @@ The `discover` command automatically:
 3. Downloads collected SBOM files locally
 4. Cleans up AWS infrastructure
 
+#### IAM for the operator running `deploy` / `discover`
+
+Use an IAM user or role **with the AWS CLI** (your laptop, CI, or a jump host). This is separate from the SSM service role and from EC2 instance profiles.
+
+The stack creates S3 buckets and an **SSM document** (`AWS::SSM::Document`). Your operator policy must include, in addition to CloudFormation and S3:
+
+- `ssm:CreateDocument`, `ssm:UpdateDocument`, `ssm:DeleteDocument` on `arn:aws:ssm:REGION:ACCOUNT_ID:document/*` (or the document name prefix your stack uses)
+
+Without **`ssm:CreateDocument`**, CloudFormation often fails creating `GravitonDiscoveryDocument` and the stack ends in **`ROLLBACK_COMPLETE`**.
+
+Keep **`graviton-fleet-discovery.yaml`** in the **same directory** as `graviton-discovery-manager.sh` (it ships in this repo under `scripts/app_identifier/`).
+
+#### CloudFormation stack rolled back (`ROLLBACK_COMPLETE`)
+
+See which resource failed:
+
+```bash
+aws cloudformation describe-stack-events \
+  --stack-name graviton-fleet-discovery \
+  --region YOUR_REGION \
+  --query 'StackEvents[?ResourceStatus==`CREATE_FAILED`].[LogicalResourceId,ResourceStatusReason]' \
+  --output table
+```
+
+Then delete the failed stack before trying again:
+
+```bash
+aws cloudformation delete-stack --stack-name graviton-fleet-discovery --region YOUR_REGION
+aws cloudformation wait stack-delete-complete --stack-name graviton-fleet-discovery --region YOUR_REGION
+```
+
 #### Output Structure
 
 SBOM files are downloaded to a timestamped directory:
