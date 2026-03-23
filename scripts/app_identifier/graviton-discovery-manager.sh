@@ -6,6 +6,8 @@ set -e
 STACK_NAME="graviton-fleet-discovery"
 TEMPLATE_FILE="graviton-fleet-discovery.yaml"
 LOG_LEVEL="INFO"
+# AWS SendCommand defaults MaxErrors=0 → one bad instance fails the whole batch. Use 100% to run all targets.
+SSM_MAX_ERRORS="${SSM_MAX_ERRORS:-100%}"
 
 # Colors & Logging
 R='\033[0;31m' G='\033[0;32m' Y='\033[1;33m' B='\033[0;34m' N='\033[0m'
@@ -82,6 +84,10 @@ OPTIONS:
   --region REGION    AWS region
   --dry-run          Show commands only
   --help             Show help
+
+Environment (optional):
+  SSM_MAX_ERRORS        Error budget per SendCommand (default: 100%). AWS default 0 fails entire batch after first error.
+  SSM_MAX_CONCURRENCY   e.g. 10 to limit parallel runs per command
 
 Examples:
   $(basename "$0") discover --all --region us-west-2
@@ -203,6 +209,15 @@ stack_op() {
     return 0
 }
 
+# List instances that did not report Success (for debugging).
+dump_non_success_ssm_invocations() {
+    local cid="$1" reg="$2"
+    warn "Non-success invocations for command $cid (table below; full output: SSM → Run Command → $cid):"
+    aws ssm list-command-invocations --region "$reg" --command-id "$cid" \
+        --query 'CommandInvocations[?Status!=`Success`].[InstanceId,Status,StatusDetails]' --output table 2>/dev/null \
+        || warn "Could not list invocations (check IAM: ssm:ListCommandInvocations)."
+}
+
 # Send SSM Run Command in chunks of 50 instance IDs (AWS limit). Prints one CommandId per line to stdout.
 send_command_batches() {
     local doc="$1" reg="$2" level="$3" dry="$4" ids_flat="$5"
@@ -216,7 +231,9 @@ send_command_batches() {
         local batch=("${id_array[@]:i:batch_size}")
         local id_args=""
         for id in "${batch[@]}"; do id_args="$id_args \"$id\""; done
-        local base="aws ssm send-command --region \"$reg\" --document-name \"$doc\" --instance-ids$id_args"
+        local base="aws ssm send-command --region \"$reg\" --document-name \"$doc\" --max-errors \"$SSM_MAX_ERRORS\""
+        [[ -n "${SSM_MAX_CONCURRENCY:-}" ]] && base="$base --max-concurrency \"$SSM_MAX_CONCURRENCY\""
+        base="$base --instance-ids$id_args"
         [[ "$level" != "INFO" ]] && base="$base --parameters logLevel=$level"
 
         info "SSM batch $batch_num (${#batch[@]} instance(s), ${#id_array[@]} total)"
@@ -270,7 +287,9 @@ execute() {
                 [[ ${#parts[@]} -eq 2 ]] || { err "Invalid tag: $pair"; return 1; }
                 targets="$targets \"Key=tag:${parts[0]},Values=${parts[1]}\""
             done
-            local cmd="aws ssm send-command --region \"$reg\" --document-name \"$doc\" --targets$targets"
+            local cmd="aws ssm send-command --region \"$reg\" --document-name \"$doc\" --max-errors \"$SSM_MAX_ERRORS\""
+            [[ -n "${SSM_MAX_CONCURRENCY:-}" ]] && cmd="$cmd --max-concurrency \"$SSM_MAX_CONCURRENCY\""
+            cmd="$cmd --targets$targets"
             [[ "$level" != "INFO" ]] && cmd="$cmd --parameters logLevel=$level"
             [[ "$dry" == "true" ]] && { warn "DRY RUN: $cmd"; return 0; }
             info "Executing SSM command..."
@@ -314,10 +333,14 @@ wait_ssm() {
     local start=$(date +%s) limit=$((timeout * 60))
     
     while true; do
-        local status=$(aws ssm list-commands --region "$reg" --command-id "$id" --query 'Commands[0].Status' --output text 2>/dev/null || echo "Unknown")
-        local targets=$(aws ssm list-commands --region "$reg" --command-id "$id" --query 'Commands[0].TargetCount' --output text 2>/dev/null || echo "0")
-        local done=$(aws ssm list-commands --region "$reg" --command-id "$id" --query 'Commands[0].CompletedCount' --output text 2>/dev/null || echo "0")
-        local errors=$(aws ssm list-commands --region "$reg" --command-id "$id" --query 'Commands[0].ErrorCount' --output text 2>/dev/null || echo "0")
+        local status targets done errors
+        status=$(aws ssm list-commands --region "$reg" --command-id "$id" --query 'Commands[0].Status' --output text 2>/dev/null || echo "Unknown")
+        targets=$(aws ssm list-commands --region "$reg" --command-id "$id" --query 'Commands[0].TargetCount' --output text 2>/dev/null || echo "0")
+        done=$(aws ssm list-commands --region "$reg" --command-id "$id" --query 'Commands[0].CompletedCount' --output text 2>/dev/null || echo "0")
+        errors=$(aws ssm list-commands --region "$reg" --command-id "$id" --query 'Commands[0].ErrorCount' --output text 2>/dev/null || echo "0")
+        [[ "$targets" == "None" || -z "$targets" ]] && targets="0"
+        [[ "$done" == "None" || -z "$done" ]] && done="0"
+        [[ "$errors" == "None" || -z "$errors" ]] && errors="0"
         
         info "Status: $status | Targets: $targets | Done: $done | Errors: $errors"
         
@@ -330,7 +353,22 @@ wait_ssm() {
                 info "SSM completed successfully ($targets target(s))!"
                 return 0
                 ;;
-            "Failed"|"Cancelled") err "SSM $status!"; return 1 ;;
+            "Failed")
+                # With MaxErrors=0, AWS stops early: CompletedCount < TargetCount. With SSM_MAX_ERRORS=100%, all targets run; aggregate status can still be Failed if any instance failed.
+                if [[ -n "$targets" && "$targets" != "0" && "$done" == "$targets" ]]; then
+                    warn "SSM command finished on all $targets target(s) with $errors error(s); continuing (SBOMs from successful hosts are still in S3)."
+                    [[ "${errors:-0}" != "0" ]] && dump_non_success_ssm_invocations "$id" "$reg"
+                    return 0
+                fi
+                err "SSM Failed (stopped early or incomplete: done=$done targets=$targets errors=$errors). Try SSM_MAX_ERRORS=100% or inspect command in console."
+                dump_non_success_ssm_invocations "$id" "$reg"
+                return 1
+                ;;
+            "Cancelled"|"TimedOut"|"Cancelling")
+                err "SSM $status!"
+                dump_non_success_ssm_invocations "$id" "$reg"
+                return 1
+                ;;
         esac
         
         if [[ $(( $(date +%s) - start )) -ge $limit ]]; then
