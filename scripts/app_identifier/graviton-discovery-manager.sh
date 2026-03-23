@@ -34,11 +34,12 @@ list_ssm_online_instance_ids() {
 
 # CloudFormation creates S3 buckets; the caller must not be the SSM Quick Setup service role mis-attached as an instance profile.
 assert_aws_operator_for_infrastructure() {
+    [[ "${GRAVITON_BYPASS_QUICK_SETUP_ROLE_CHECK:-}" == "1" ]] && return 0
     local arn
     arn=$(aws sts get-caller-identity --query Arn --output text 2>/dev/null) || return 0
     [[ -z "$arn" || "$arn" == "None" ]] && return 0
     if [[ "$arn" == *"AmazonSSMRoleForInstancesQuickSetup"* ]]; then
-        err "AWS identity is AmazonSSMRoleForInstancesQuickSetup (often wrongly used as an EC2 instance profile). It cannot s3:CreateBucket or manage CloudFormation. Run deploy/discover/delete from: your laptop (aws configure / SSO), or an EC2 jump box whose instance profile is a dedicated operator role (CloudFormation + S3 + SSM document APIs + SendCommand). Detach AmazonSSMRoleForInstancesQuickSetup from this instance; use AmazonSSMManagedInstanceCore on workload instances only."
+        err "AWS identity is AmazonSSMRoleForInstancesQuickSetup. If you attached a broad operator policy to this role on purpose, set GRAVITON_BYPASS_QUICK_SETUP_ROLE_CHECK=1 and re-run. Otherwise run deploy/discover from a laptop (SSO/keys) or a jump host with a dedicated operator instance profile (see iam-graviton-discovery-operator-policy.json)."
         return 1
     fi
     return 0
