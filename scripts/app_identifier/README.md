@@ -627,8 +627,9 @@ LOG_LEVEL=DEBUG ./app_identifier.sh custom_output.sbom.json
 #### Available Options
 
 **Targeting Options** (for execute/discover commands):
-- `--all`: Target all SSM-managed instances
-- `--instance-id IDS`: Target specific instances (space-separated or file path, space or newline separated instance ids)
+- `--all`: All SSM **PingStatus=Online** instances in the region (uses each instance’s **SSM `IamRole`** name from `describe-instance-information`, not EC2 tags)
+- `--exclude-iam-role-substring STR`: With **`--all` only** — skip instances whose SSM **`IamRole`** contains `STR`. Use this for **EKS/Karpenter** (or other) nodes whose **instance role** cannot call **S3** on the discovery bucket. Example: `--exclude-iam-role-substring KarpenterNodeRole` (repeat the flag for multiple patterns, or set `GRAVITON_EXCLUDE_IAM_ROLE_SUBSTRING=KarpenterNodeRole,eks-node`).
+- `--instance-id IDS`: Target specific instances (no IAM-role filter; you choose IDs explicitly)
 - `--tag KEY=VALUE`: Target instances by EC2 tags
 
 **Global Options**:
@@ -666,9 +667,10 @@ echo "i-123 i-456 i-789" > instances.txt
 ./graviton-discovery-manager.sh execute --tag "Environment=Production,Team=WebServices"
 ```
 
-**Target All Instances**:
+**Target All Instances** (optionally skip EKS worker roles without bucket S3 access):
 ```bash
-./graviton-discovery-manager.sh discover --all --region us-west-2
+./graviton-discovery-manager.sh discover --all --region us-west-2 \
+  --exclude-iam-role-substring KarpenterNodeRole
 ```
 
 #### Dry Run Mode

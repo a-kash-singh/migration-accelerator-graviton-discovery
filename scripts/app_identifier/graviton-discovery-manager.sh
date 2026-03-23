@@ -26,12 +26,40 @@ flatten_instance_id_list() {
     echo "$1" | tr '\t\n\r' '   ' | tr -s ' ' | sed 's/^ *//;s/ *$//'
 }
 
-# All SSM-managed instances with PingStatus=Online in region (paginates via CLI).
+# SSM Online instances in region. If EXCLUDE_IAM_ROLE_SUBSTRING is non-empty, drop rows whose
+# IamRole (from describe-instance-information) contains any listed substring — e.g. Karpenter/EKS
+# nodes that lack s3:ListBucket on the discovery bucket.
 list_ssm_online_instance_ids() {
     local reg="$1"
-    aws ssm describe-instance-information --region "$reg" \
+    if [[ ${#EXCLUDE_IAM_ROLE_SUBSTRING[@]} -eq 0 ]]; then
+        aws ssm describe-instance-information --region "$reg" \
+            --filters "Key=PingStatus,Values=Online" \
+            --query 'InstanceInformationList[].InstanceId' --output text 2>/dev/null
+        return 0
+    fi
+
+    local id role out="" excluded=0
+    while IFS=$'\t' read -r id role; do
+        [[ -z "$id" || "$id" == "None" ]] && continue
+        local skip=0 ex
+        for ex in "${EXCLUDE_IAM_ROLE_SUBSTRING[@]}"; do
+            [[ -z "$ex" ]] && continue
+            if [[ -n "$role" && "$role" != "None" && "$role" == *"$ex"* ]]; then
+                skip=1
+                break
+            fi
+        done
+        if [[ "$skip" -eq 1 ]]; then
+            excluded=$((excluded + 1))
+            continue
+        fi
+        out="$out $id"
+    done < <(aws ssm describe-instance-information --region "$reg" \
         --filters "Key=PingStatus,Values=Online" \
-        --query 'InstanceInformationList[].InstanceId' --output text 2>/dev/null
+        --query 'InstanceInformationList[].[InstanceId,IamRole]' --output text 2>/dev/null)
+
+    [[ "$excluded" -gt 0 ]] && info "Excluded $excluded SSM Online instance(s) (IamRole matches --exclude-iam-role-substring: ${EXCLUDE_IAM_ROLE_SUBSTRING[*]})"
+    echo "$out" | sed 's/^ *//;s/ *$//'
 }
 
 # CloudFormation creates S3 buckets; the caller must not be the SSM Quick Setup service role mis-attached as an instance profile.
@@ -84,6 +112,7 @@ OPTIONS:
   --tag KEY=VALUE    Target by EC2 tag (Key=Value)
   --region REGION    AWS region
   --allow-quick-setup-role  Allow deploy/update/delete when caller is AmazonSSMRoleForInstancesQuickSetup (only if you added the operator IAM policy to that role)
+  --exclude-iam-role-substring STR  With --all only: skip instances whose SSM IamRole contains STR (repeat flag for multiple). E.g. KarpenterNodeRole for EKS nodes without discovery-bucket S3 access.
   --dry-run          Show commands only
   --help             Show help
 
@@ -91,6 +120,7 @@ Environment (optional):
   SSM_MAX_ERRORS           Error budget per SendCommand (default: 100%). AWS default 0 fails entire batch after first error.
   SSM_MAX_CONCURRENCY      e.g. 10 to limit parallel runs per command
   SSM_WAIT_POLL_SECONDS    Seconds between list-commands polls (default: 10)
+  GRAVITON_EXCLUDE_IAM_ROLE_SUBSTRING  Comma-separated substrings (same as repeated --exclude-iam-role-substring)
 
 Examples:
   $(basename "$0") discover --all --region us-west-2
@@ -550,6 +580,7 @@ discover() {
 
 # Parse arguments
 CMD="" TARGET_TYPE="" TARGET_VALUE="" DRY="false" REGION="" ALLOW_QUICK_SETUP_ROLE="0"
+EXCLUDE_IAM_ROLE_SUBSTRING=()
 
 [[ $# -eq 0 ]] && { usage; exit 1; }
 
@@ -578,11 +609,27 @@ while [[ $# -gt 0 ]]; do
         --tag) TARGET_TYPE="tag" TARGET_VALUE="$2"; shift 2 ;;
         --region) REGION="$2"; shift 2 ;;
         --allow-quick-setup-role) ALLOW_QUICK_SETUP_ROLE="1"; shift ;;
+        --exclude-iam-role-substring)
+            [[ -z "${2:-}" ]] && { err "--exclude-iam-role-substring requires a value"; exit 1; }
+            EXCLUDE_IAM_ROLE_SUBSTRING+=("$2")
+            shift 2
+            ;;
         --dry-run) DRY="true"; shift ;;
         --help) usage; exit 0 ;;
         *) log error "$R" "Unknown option: $1"; usage; exit 1 ;;
     esac
 done
+
+if [[ -n "${GRAVITON_EXCLUDE_IAM_ROLE_SUBSTRING:-}" ]]; then
+    _graviton_ifs=$IFS
+    IFS=',' read -ra _graviton_ex <<< "${GRAVITON_EXCLUDE_IAM_ROLE_SUBSTRING}"
+    IFS=$_graviton_ifs
+    for x in "${_graviton_ex[@]}"; do
+        x="${x#"${x%%[![:space:]]*}"}"
+        x="${x%"${x##*[![:space:]]}"}"
+        [[ -n "$x" ]] && EXCLUDE_IAM_ROLE_SUBSTRING+=("$x")
+    done
+fi
 
 # Check AWS CLI
 command -v aws >/dev/null || err "AWS CLI not found"
