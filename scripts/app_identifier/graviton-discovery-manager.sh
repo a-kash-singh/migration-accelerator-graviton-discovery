@@ -16,8 +16,21 @@ info() { log info "$G" "$1"; }
 
 # AWS Utilities
 region() { aws configure get region 2>/dev/null || echo "us-east-1"; }
-exists() { aws cloudformation describe-stacks --stack-name "$1" >/dev/null 2>&1; }
-output() { aws cloudformation describe-stacks --stack-name "$1" --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue" --output text 2>/dev/null; }
+exists() { aws cloudformation describe-stacks --stack-name "$1" --region "${REGION:-$(region)}" >/dev/null 2>&1; }
+output() { aws cloudformation describe-stacks --stack-name "$1" --region "${REGION:-$(region)}" --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue" --output text 2>/dev/null; }
+
+# Normalize AWS CLI text output (tabs/newlines) to a single space-separated list.
+flatten_instance_id_list() {
+    echo "$1" | tr '\t\n\r' '   ' | tr -s ' ' | sed 's/^ *//;s/ *$//'
+}
+
+# All SSM-managed instances with PingStatus=Online in region (paginates via CLI).
+list_ssm_online_instance_ids() {
+    local reg="$1"
+    aws ssm describe-instance-information --region "$reg" \
+        --filters "Key=PingStatus,Values=Online" \
+        --query 'InstanceInformationList[].InstanceId' --output text 2>/dev/null
+}
 
 # Parse instance IDs from input (file or inline)
 parse_instance_ids() {
@@ -50,9 +63,9 @@ COMMANDS:
   discover   Complete automated workflow
 
 OPTIONS:
-  --all              Target all instances
+  --all              All SSM-managed instances with PingStatus=Online in the region (not EC2 tags)
   --instance-id IDS  Target specific instances (space/newline separated or file path)
-  --tag KEY=VALUE    Target by tag
+  --tag KEY=VALUE    Target by EC2 tag (Key=Value)
   --region REGION    AWS region
   --dry-run          Show commands only
   --help             Show help
@@ -121,94 +134,194 @@ wait_stack() {
         sleep 3
     done
     
-    wait $pid && { printf "\n"; info "Stack $op completed!"; } || err "Stack $op failed!"
+    if wait $pid; then
+        printf "\n"
+        info "Stack $op completed!"
+        return 0
+    fi
+    printf "\n"
+    err "Stack $op failed!"
+    return 1
 }
 
 # Stack operations (deploy/update)
 stack_op() {
     local op="$1" name="$2" template="$3" dry="$4" region="$5"
-    [[ ! -f "$template" ]] && err "Template not found: $template"
-    
+    [[ ! -f "$template" ]] && { err "Template not found: $template"; return 1; }
+
     if [[ "$op" == "create" ]]; then
-        exists "$name" && err "Stack exists. Use update."
+        if exists "$name"; then
+            err "Stack exists. Use update."
+            return 1
+        fi
     else
-        ! exists "$name" && err "Stack missing. Use deploy."
+        if ! exists "$name"; then
+            err "Stack missing. Use deploy."
+            return 1
+        fi
     fi
-    
+
     local cmd="aws cloudformation $op-stack --stack-name $name --template-body file://$template --capabilities CAPABILITY_NAMED_IAM --region $region"
-    
-    [[ "$dry" == "true" ]] && { warn "DRY RUN: $cmd"; return; }
-    
+
+    [[ "$dry" == "true" ]] && { warn "DRY RUN: $cmd"; return 0; }
+
     local action="deploy"
     [[ "$op" == "update" ]] && action="updat"
     info "${action}ing stack: $name"
-    eval "$cmd" || err "Stack $op failed"
-    
-    wait_stack "$name" "$op" "$region"
-    
-    local bucket=$(output "$name" "S3BucketName")
+
+    local cf_out cf_rc
+    cf_out=$(eval "$cmd" 2>&1) && cf_rc=0 || cf_rc=$?
+    if [[ $cf_rc -ne 0 ]]; then
+        if [[ "$op" == "update" && "$cf_out" == *"No updates are to be performed"* ]]; then
+            warn "CloudFormation template unchanged (no stack update). Uploading discovery script to the bucket anyway."
+        else
+            err "Stack $op failed: $cf_out"
+            return 1
+        fi
+    else
+        if ! wait_stack "$name" "$op" "$region"; then return 1; fi
+    fi
+
+    local bucket
+    bucket=$(output "$name" "S3BucketName")
     [[ -n "$bucket" ]] && upload "$bucket" "$region" >/dev/null
+    return 0
 }
 
-# Execute SSM command
+# Send SSM Run Command in chunks of 50 instance IDs (AWS limit). Prints one CommandId per line to stdout.
+send_command_batches() {
+    local doc="$1" reg="$2" level="$3" dry="$4" ids_flat="$5"
+    local -a id_array=()
+    read -ra id_array <<< "$ids_flat"
+    [[ ${#id_array[@]} -eq 0 ]] && { err "No instance IDs to target"; return 1; }
+
+    local batch_size=50 i=0 batch_num=0
+    while (( i < ${#id_array[@]} )); do
+        ((batch_num++))
+        local batch=("${id_array[@]:i:batch_size}")
+        local id_args=""
+        for id in "${batch[@]}"; do id_args="$id_args \"$id\""; done
+        local base="aws ssm send-command --region \"$reg\" --document-name \"$doc\" --instance-ids$id_args"
+        [[ "$level" != "INFO" ]] && base="$base --parameters logLevel=$level"
+
+        info "SSM batch $batch_num (${#batch[@]} instance(s), ${#id_array[@]} total)"
+        if [[ "$dry" == "true" ]]; then
+            warn "DRY RUN: $base"
+        else
+            local bid
+            bid=$(eval "$base" --query 'Command.CommandId' --output text) || { err "SSM batch $batch_num failed"; return 1; }
+            [[ -z "$bid" ]] && { err "SSM batch $batch_num returned empty CommandId"; return 1; }
+            info "Command ID: $bid"
+            echo "$bid"
+        fi
+        ((i += batch_size))
+    done
+    return 0
+}
+
+# Execute SSM command. For --all, stdout is one command ID per line (batched). Else one line.
 execute() {
     local name="$1" type="$2" value="$3" level="$4" dry="$5"
-    ! exists "$name" && err "Stack missing. Deploy first."
-    
-    local doc=$(output "$name" "SSMDocumentName")
-    [[ -z "$doc" ]] && err "SSM document not found"
-    
-    local cmd="aws ssm send-command --document-name \"$doc\""
-    
+    local reg="${6:-${REGION:-$(region)}}"
+
+    if ! exists "$name"; then
+        err "Stack missing. Deploy first."
+        return 1
+    fi
+
+    local doc
+    doc=$(output "$name" "SSMDocumentName")
+    [[ -z "$doc" ]] && { err "SSM document not found"; return 1; }
+
+    info "Target: $type=$value"
+
     case "$type" in
-        "instance-id") 
-            local ids=""
-            for id in $value; do ids="$ids \"$id\""; done
-            cmd="$cmd --instance-ids$ids" ;;
+        "instance-id")
+            local ids_flat
+            ids_flat=$(flatten_instance_id_list "$value")
+            [[ -z "$ids_flat" ]] && { err "No instance IDs provided"; return 1; }
+            [[ "$dry" == "true" ]] && {
+                warn "DRY RUN: send-command to ${ids_flat// /, }"
+                return 0
+            }
+            info "Executing SSM command..."
+            send_command_batches "$doc" "$reg" "$level" "$dry" "$ids_flat"
+            ;;
         "tag")
             local targets=""
             IFS=',' read -ra pairs <<< "$value"
             for pair in "${pairs[@]}"; do
                 IFS='=' read -ra parts <<< "$pair"
-                [[ ${#parts[@]} -eq 2 ]] || err "Invalid tag: $pair"
+                [[ ${#parts[@]} -eq 2 ]] || { err "Invalid tag: $pair"; return 1; }
                 targets="$targets \"Key=tag:${parts[0]},Values=${parts[1]}\""
             done
-            cmd="$cmd --targets$targets" ;;
-        "all") cmd="$cmd --targets \"Key=tag:aws:ssm:managed-instance,Values=true\"" ;;
-        *) err "Invalid target: $type" ;;
+            local cmd="aws ssm send-command --region \"$reg\" --document-name \"$doc\" --targets$targets"
+            [[ "$level" != "INFO" ]] && cmd="$cmd --parameters logLevel=$level"
+            [[ "$dry" == "true" ]] && { warn "DRY RUN: $cmd"; return 0; }
+            info "Executing SSM command..."
+            local id
+            id=$(eval "$cmd" --query 'Command.CommandId' --output text) || { err "SSM execution failed"; return 1; }
+            [[ -z "$id" ]] && { err "SSM returned empty CommandId"; return 1; }
+            info "Command ID: $id"
+            echo "$id"
+            ;;
+        "all")
+            local ids_raw ids_flat n
+            ids_raw=$(list_ssm_online_instance_ids "$reg")
+            ids_flat=$(flatten_instance_id_list "$ids_raw")
+            n=0
+            [[ -n "$ids_flat" ]] && read -ra _cnt <<< "$ids_flat" && n=${#_cnt[@]}
+            info "SSM Online instances in $reg: $n"
+            [[ "$n" -eq 0 ]] && {
+                err "No SSM Online instances in $reg. Ensure agents are registered and PingStatus=Online."
+                return 1
+            }
+            [[ "$dry" == "true" ]] && {
+                warn "DRY RUN: would send-command to $n instance(s) in batch(es) of up to 50"
+                return 0
+            }
+            info "Executing discovery..."
+            send_command_batches "$doc" "$reg" "$level" "$dry" "$ids_flat"
+            ;;
+        *)
+            err "Invalid target: $type"
+            return 1
+            ;;
     esac
-    
-    [[ "$level" != "INFO" ]] && cmd="$cmd --parameters logLevel=$level"
-    
-    info "Target: $type=$value"
-    [[ "$dry" == "true" ]] && { warn "DRY RUN: $cmd"; return; }
-    
-    info "Executing SSM command..."
-    local id=$(eval "$cmd" --query 'Command.CommandId' --output text)
-    [[ $? -eq 0 && -n "$id" ]] && { info "Command ID: $id"; echo "$id"; } || err "SSM execution failed"
 }
 
 # Wait for SSM completion
 wait_ssm() {
     local id="$1" timeout="${2:-30}"
+    local reg="${3:-${REGION:-$(region)}}"
     info "Waiting for SSM completion (${timeout}m timeout)..."
     
     local start=$(date +%s) limit=$((timeout * 60))
     
     while true; do
-        local status=$(aws ssm list-commands --command-id "$id" --query 'Commands[0].Status' --output text 2>/dev/null || echo "Unknown")
-        local targets=$(aws ssm list-commands --command-id "$id" --query 'Commands[0].TargetCount' --output text 2>/dev/null || echo "0")
-        local done=$(aws ssm list-commands --command-id "$id" --query 'Commands[0].CompletedCount' --output text 2>/dev/null || echo "0")
-        local errors=$(aws ssm list-commands --command-id "$id" --query 'Commands[0].ErrorCount' --output text 2>/dev/null || echo "0")
+        local status=$(aws ssm list-commands --region "$reg" --command-id "$id" --query 'Commands[0].Status' --output text 2>/dev/null || echo "Unknown")
+        local targets=$(aws ssm list-commands --region "$reg" --command-id "$id" --query 'Commands[0].TargetCount' --output text 2>/dev/null || echo "0")
+        local done=$(aws ssm list-commands --region "$reg" --command-id "$id" --query 'Commands[0].CompletedCount' --output text 2>/dev/null || echo "0")
+        local errors=$(aws ssm list-commands --region "$reg" --command-id "$id" --query 'Commands[0].ErrorCount' --output text 2>/dev/null || echo "0")
         
         info "Status: $status | Targets: $targets | Done: $done | Errors: $errors"
         
         case "$status" in
-            "Success") info "SSM completed successfully!"; return 0 ;;
-            "Failed"|"Cancelled") err "SSM $status!" ;;
+            "Success")
+                if [[ "${targets:-0}" == "0" ]]; then
+                    err "SSM reported Success but TargetCount=0 (no instances ran the document). Use fixed --all (SSM Online list) or fix --tag/--instance-id."
+                    return 1
+                fi
+                info "SSM completed successfully ($targets target(s))!"
+                return 0
+                ;;
+            "Failed"|"Cancelled") err "SSM $status!"; return 1 ;;
         esac
         
-        [[ $(( $(date +%s) - start )) -ge $limit ]] && err "SSM timeout after ${timeout}m"
+        if [[ $(( $(date +%s) - start )) -ge $limit ]]; then
+            err "SSM timeout after ${timeout}m"
+            return 1
+        fi
         sleep 10
     done
 }
@@ -304,18 +417,34 @@ discover() {
         [[ ! $REPLY =~ ^[Yy]$ ]] && { info "Cancelled"; return; }
     }
     
-    # Deploy
+    # Deploy (create if missing, else update — avoids AlreadyExists on re-runs)
     info "Step 1/4: Deploying infrastructure..."
-    stack_op "create" "$name" "$template" "$dry" "$region" || err "Deploy failed"
-    
+    if exists "$name"; then
+        info "Stack $name already exists; updating template and uploading script..."
+        stack_op "update" "$name" "$template" "$dry" "$region" || { err "Update failed"; return 1; }
+    else
+        info "deploying stack: $name"
+        stack_op "create" "$name" "$template" "$dry" "$region" || { err "Deploy failed"; return 1; }
+    fi
+
     [[ "$dry" == "true" ]] && { info "DRY RUN: Would continue workflow"; return; }
-    
-    # Execute
+
+    # Execute (stdout: one command ID per batch for --all / many instance-ids)
     info "Step 2/4: Executing discovery..."
-    local cmd_id=$(execute "$name" "$type" "$value" "$level" "$dry")
-    [[ $? -ne 0 || -z "$cmd_id" ]] && err "Execute failed"
-    
-    wait_ssm "$cmd_id" 30 || err "SSM failed"
+    local cmd_out
+    if ! cmd_out=$(execute "$name" "$type" "$value" "$level" "$dry" "$region"); then
+        err "Execute failed"
+        return 1
+    fi
+    if [[ -z "$(echo "$cmd_out" | tr -d '[:space:]')" ]]; then
+        err "Execute failed (no command ID returned)"
+        return 1
+    fi
+    local cid
+    while IFS= read -r cid; do
+        [[ -z "$cid" ]] && continue
+        wait_ssm "$cid" 30 "$region" || { err "SSM failed for command $cid"; return 1; }
+    done <<< "$cmd_out"
     
     # Download
     info "Step 3/4: Downloading results..."
@@ -382,11 +511,19 @@ command -v aws >/dev/null || err "AWS CLI not found"
 # Main
 info "Graviton Fleet Discovery Manager"
 prompt "$CMD"
+[[ -n "$REGION" ]] && export AWS_DEFAULT_REGION="$REGION"
 
 case "$CMD" in
-    deploy) stack_op "create" "$STACK_NAME" "$TEMPLATE_FILE" "$DRY" "$REGION" ;;
+    deploy)
+        if exists "$STACK_NAME"; then
+            info "Stack exists; updating..."
+            stack_op "update" "$STACK_NAME" "$TEMPLATE_FILE" "$DRY" "$REGION"
+        else
+            stack_op "create" "$STACK_NAME" "$TEMPLATE_FILE" "$DRY" "$REGION"
+        fi
+        ;;
     update) stack_op "update" "$STACK_NAME" "$TEMPLATE_FILE" "$DRY" "$REGION" ;;
-    execute) execute "$STACK_NAME" "$TARGET_TYPE" "$TARGET_VALUE" "$LOG_LEVEL" "$DRY" ;;
+    execute) execute "$STACK_NAME" "$TARGET_TYPE" "$TARGET_VALUE" "$LOG_LEVEL" "$DRY" "$REGION" ;;
     download) download "$STACK_NAME" ;;
     delete) delete "$STACK_NAME" "$DRY" "$REGION" ;;
     status) status "$STACK_NAME" "$REGION" ;;
