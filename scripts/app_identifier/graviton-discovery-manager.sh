@@ -32,6 +32,18 @@ list_ssm_online_instance_ids() {
         --query 'InstanceInformationList[].InstanceId' --output text 2>/dev/null
 }
 
+# CloudFormation creates S3 buckets; the caller must not be the SSM Quick Setup service role mis-attached as an instance profile.
+assert_aws_operator_for_infrastructure() {
+    local arn
+    arn=$(aws sts get-caller-identity --query Arn --output text 2>/dev/null) || return 0
+    [[ -z "$arn" || "$arn" == "None" ]] && return 0
+    if [[ "$arn" == *"AmazonSSMRoleForInstancesQuickSetup"* ]]; then
+        err "AWS identity is AmazonSSMRoleForInstancesQuickSetup (often wrongly used as an EC2 instance profile). It cannot s3:CreateBucket or manage CloudFormation. Run deploy/discover/delete from: your laptop (aws configure / SSO), or an EC2 jump box whose instance profile is a dedicated operator role (CloudFormation + S3 + SSM document APIs + SendCommand). Detach AmazonSSMRoleForInstancesQuickSetup from this instance; use AmazonSSMManagedInstanceCore on workload instances only."
+        return 1
+    fi
+    return 0
+}
+
 # Parse instance IDs from input (file or inline)
 parse_instance_ids() {
     local input="$1" ids=""
@@ -148,6 +160,8 @@ wait_stack() {
 stack_op() {
     local op="$1" name="$2" template="$3" dry="$4" region="$5"
     [[ ! -f "$template" ]] && { err "Template not found: $template"; return 1; }
+
+    assert_aws_operator_for_infrastructure || return 1
 
     if [[ "$op" == "create" ]]; then
         if exists "$name"; then
@@ -363,6 +377,8 @@ download() {
 delete() {
     local name="$1" dry="$2" region="$3"
     ! exists "$name" && err "Stack missing"
+
+    assert_aws_operator_for_infrastructure || return 1
     
     local bucket=$(output "$name" "S3BucketName")
     

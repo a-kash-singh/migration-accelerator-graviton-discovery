@@ -97,6 +97,8 @@ The `discover` command automatically:
 
 Use an IAM user or role **with the AWS CLI** (your laptop, CI, or a jump host). This is separate from the SSM service role and from EC2 instance profiles.
 
+**Do not** attach **`AmazonSSMRoleForInstancesQuickSetup`** as your EC2 **instance profile** to run this script. That role is for SSM Quick Setup automation, not for creating buckets or stacks; CloudFormation will fail with `s3:CreateBucket` **AccessDenied**. Use **`AmazonSSMManagedInstanceCore`** (plus your app needs) on normal instances, and a **dedicated operator role** on the machine where you run `deploy` / `discover`.
+
 The stack creates S3 buckets and an **SSM document** (`AWS::SSM::Document`). Your operator policy must include, in addition to CloudFormation and S3:
 
 - `ssm:CreateDocument`, `ssm:UpdateDocument`, `ssm:DeleteDocument` on `arn:aws:ssm:REGION:ACCOUNT_ID:document/*` (or the document name prefix your stack uses)
