@@ -121,6 +121,7 @@ Environment (optional):
   SSM_MAX_CONCURRENCY      e.g. 10 to limit parallel runs per command
   SSM_WAIT_POLL_SECONDS    Seconds between list-commands polls (default: 10)
   GRAVITON_EXCLUDE_IAM_ROLE_SUBSTRING  Comma-separated substrings (same as repeated --exclude-iam-role-substring)
+  SSM_STALL_DUMP_REPEAT             Set to 1 to print non-success table on every stall interval (default: first stall only)
 
 Examples:
   $(basename "$0") discover --all --region us-west-2
@@ -362,10 +363,10 @@ wait_ssm() {
     local id="$1" timeout="${2:-30}"
     local reg="${3:-${REGION:-$(region)}}"
     info "Waiting for SSM completion (${timeout}m timeout)..."
-    info "Metrics: CompletedCount (Done) = finished invocations; ErrorCount = failed; pending ≈ Targets − Done. InProgress + no count change = stragglers or stuck agents (document timeouts are often 300s/600s per step)."
+    info "Metrics: Done=CompletedCount (finished, success or fail); Errors=failed; ~Succeeded≈Done−Errors; ~Pending=Targets−Done. Undeliverable=agent/offline; Delayed=SSM queue/throttle. Stragglers often hit 300s/600s per document step."
 
     local start=$(date +%s) limit=$((timeout * 60))
-    local prev_done="" prev_errors="" stall_cycles=0
+    local prev_done="" prev_errors="" stall_cycles=0 stall_table_dumped=0
     local sleep_s="${SSM_WAIT_POLL_SECONDS:-10}"
 
     while true; do
@@ -381,6 +382,9 @@ wait_ssm() {
 
         pending=$((targets - done))
         [[ "$pending" -lt 0 ]] && pending=0
+        local ok=0
+        [[ "$done" =~ ^[0-9]+$ && "$errors" =~ ^[0-9]+$ ]] && ok=$((done - errors))
+        [[ "$ok" -lt 0 ]] && ok=0
 
         if [[ "$done" == "$prev_done" && "$errors" == "$prev_errors" ]]; then
             stall_cycles=$((stall_cycles + 1))
@@ -390,11 +394,17 @@ wait_ssm() {
         prev_done="$done"
         prev_errors="$errors"
 
-        info "[${elapsed}s] Status: $status | Targets: $targets | Done (completed): $done | Errors: $errors | ~Pending: $pending"
+        info "[${elapsed}s] Status: $status | Targets: $targets | Done: $done | Errors: $errors | ~Succeeded: $ok | ~Pending: $pending"
 
         if [[ "$stall_cycles" -ge 6 && $((stall_cycles % 6)) -eq 0 ]]; then
-            warn "No progress on Done/Errors for ~$((stall_cycles * sleep_s))s while status=$status. Console: SSM → Run Command → $id ($reg). Common causes: instance role cannot s3:GetObject/PutObject on discovery bucket, missing jq, or aws:runShellScript timeout."
-            dump_non_success_ssm_invocations "$id" "$reg"
+            warn "No progress on Done/Errors for ~$((stall_cycles * sleep_s))s while status=$status. Console: SSM → Run Command → $id ($reg)."
+            if [[ "$stall_table_dumped" -eq 0 || "${SSM_STALL_DUMP_REPEAT:-}" == "1" ]]; then
+                warn "Common causes: S3 denied on discovery bucket (instance role), missing jq, document step timeout, Undeliverable (agent stopped/offline), Delayed (throttle)."
+                dump_non_success_ssm_invocations "$id" "$reg"
+                stall_table_dumped=1
+            else
+                warn "(Omitting repeated invocation table; set SSM_STALL_DUMP_REPEAT=1 to print again.)"
+            fi
         fi
 
         case "$status" in
