@@ -99,7 +99,7 @@ Use an IAM user or role **with the AWS CLI** (your laptop, CI, or a jump host). 
 
 **Do not** attach **`AmazonSSMRoleForInstancesQuickSetup`** as your EC2 **instance profile** to run this script unless you **deliberately** widen it (not recommended). That role is for SSM Quick Setup; without extra policy, CloudFormation fails with `s3:CreateBucket` **AccessDenied**. Prefer **`AmazonSSMManagedInstanceCore`** on workload instances and a **dedicated operator role** on the jump host.
 
-If you must use the Quick Setup role with an attached operator policy, use **`iam-graviton-discovery-operator-policy.json`** (edit **region** and **account ID** in the CloudFormation `Resource` if needed), attach it to that role, then run with **`GRAVITON_BYPASS_QUICK_SETUP_ROLE_CHECK=1`**. Remove the extra policy when finished.
+If you must use the Quick Setup role with an attached operator policy, use **`iam-graviton-discovery-operator-policy.json`** (edit **region** and **account ID** in the CloudFormation `Resource` if needed), attach it to that role, then run **`discover`** / **`deploy`** with **`--allow-quick-setup-role`** (or **`GRAVITON_BYPASS_QUICK_SETUP_ROLE_CHECK=1`**). Remove the extra policy when finished.
 
 The stack creates S3 buckets and an **SSM document** (`AWS::SSM::Document`). Your operator policy must include, in addition to CloudFormation and S3:
 

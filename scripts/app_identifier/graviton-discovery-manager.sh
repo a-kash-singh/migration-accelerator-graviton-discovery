@@ -37,11 +37,12 @@ list_ssm_online_instance_ids() {
 # CloudFormation creates S3 buckets; the caller must not be the SSM Quick Setup service role mis-attached as an instance profile.
 assert_aws_operator_for_infrastructure() {
     [[ "${GRAVITON_BYPASS_QUICK_SETUP_ROLE_CHECK:-}" == "1" ]] && return 0
+    [[ "${ALLOW_QUICK_SETUP_ROLE:-}" == "1" ]] && return 0
     local arn
     arn=$(aws sts get-caller-identity --query Arn --output text 2>/dev/null) || return 0
     [[ -z "$arn" || "$arn" == "None" ]] && return 0
     if [[ "$arn" == *"AmazonSSMRoleForInstancesQuickSetup"* ]]; then
-        err "AWS identity is AmazonSSMRoleForInstancesQuickSetup. If you attached a broad operator policy to this role on purpose, set GRAVITON_BYPASS_QUICK_SETUP_ROLE_CHECK=1 and re-run. Otherwise run deploy/discover from a laptop (SSO/keys) or a jump host with a dedicated operator instance profile (see iam-graviton-discovery-operator-policy.json)."
+        err "AWS identity is AmazonSSMRoleForInstancesQuickSetup. If you attached iam-graviton-discovery-operator-policy.json to this role, re-run with --allow-quick-setup-role (or export GRAVITON_BYPASS_QUICK_SETUP_ROLE_CHECK=1). Otherwise use a laptop (SSO/keys) or a jump host with a dedicated operator instance profile."
         return 1
     fi
     return 0
@@ -82,6 +83,7 @@ OPTIONS:
   --instance-id IDS  Target specific instances (space/newline separated or file path)
   --tag KEY=VALUE    Target by EC2 tag (Key=Value)
   --region REGION    AWS region
+  --allow-quick-setup-role  Allow deploy/update/delete when caller is AmazonSSMRoleForInstancesQuickSetup (only if you added the operator IAM policy to that role)
   --dry-run          Show commands only
   --help             Show help
 
@@ -525,7 +527,7 @@ discover() {
 }
 
 # Parse arguments
-CMD="" TARGET_TYPE="" TARGET_VALUE="" DRY="false" REGION=""
+CMD="" TARGET_TYPE="" TARGET_VALUE="" DRY="false" REGION="" ALLOW_QUICK_SETUP_ROLE="0"
 
 [[ $# -eq 0 ]] && { usage; exit 1; }
 
@@ -553,6 +555,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --tag) TARGET_TYPE="tag" TARGET_VALUE="$2"; shift 2 ;;
         --region) REGION="$2"; shift 2 ;;
+        --allow-quick-setup-role) ALLOW_QUICK_SETUP_ROLE="1"; shift ;;
         --dry-run) DRY="true"; shift ;;
         --help) usage; exit 0 ;;
         *) log error "$R" "Unknown option: $1"; usage; exit 1 ;;
