@@ -88,8 +88,9 @@ OPTIONS:
   --help             Show help
 
 Environment (optional):
-  SSM_MAX_ERRORS        Error budget per SendCommand (default: 100%). AWS default 0 fails entire batch after first error.
-  SSM_MAX_CONCURRENCY   e.g. 10 to limit parallel runs per command
+  SSM_MAX_ERRORS           Error budget per SendCommand (default: 100%). AWS default 0 fails entire batch after first error.
+  SSM_MAX_CONCURRENCY      e.g. 10 to limit parallel runs per command
+  SSM_WAIT_POLL_SECONDS    Seconds between list-commands polls (default: 10)
 
 Examples:
   $(basename "$0") discover --all --region us-west-2
@@ -331,11 +332,15 @@ wait_ssm() {
     local id="$1" timeout="${2:-30}"
     local reg="${3:-${REGION:-$(region)}}"
     info "Waiting for SSM completion (${timeout}m timeout)..."
-    
+    info "Metrics: CompletedCount (Done) = finished invocations; ErrorCount = failed; pending ≈ Targets − Done. InProgress + no count change = stragglers or stuck agents (document timeouts are often 300s/600s per step)."
+
     local start=$(date +%s) limit=$((timeout * 60))
-    
+    local prev_done="" prev_errors="" stall_cycles=0
+    local sleep_s="${SSM_WAIT_POLL_SECONDS:-10}"
+
     while true; do
-        local status targets done errors
+        local status targets done errors elapsed pending
+        elapsed=$(($(date +%s) - start))
         status=$(aws ssm list-commands --region "$reg" --command-id "$id" --query 'Commands[0].Status' --output text 2>/dev/null || echo "Unknown")
         targets=$(aws ssm list-commands --region "$reg" --command-id "$id" --query 'Commands[0].TargetCount' --output text 2>/dev/null || echo "0")
         done=$(aws ssm list-commands --region "$reg" --command-id "$id" --query 'Commands[0].CompletedCount' --output text 2>/dev/null || echo "0")
@@ -343,9 +348,25 @@ wait_ssm() {
         [[ "$targets" == "None" || -z "$targets" ]] && targets="0"
         [[ "$done" == "None" || -z "$done" ]] && done="0"
         [[ "$errors" == "None" || -z "$errors" ]] && errors="0"
-        
-        info "Status: $status | Targets: $targets | Done: $done | Errors: $errors"
-        
+
+        pending=$((targets - done))
+        [[ "$pending" -lt 0 ]] && pending=0
+
+        if [[ "$done" == "$prev_done" && "$errors" == "$prev_errors" ]]; then
+            stall_cycles=$((stall_cycles + 1))
+        else
+            stall_cycles=0
+        fi
+        prev_done="$done"
+        prev_errors="$errors"
+
+        info "[${elapsed}s] Status: $status | Targets: $targets | Done (completed): $done | Errors: $errors | ~Pending: $pending"
+
+        if [[ "$stall_cycles" -ge 6 && $((stall_cycles % 6)) -eq 0 ]]; then
+            warn "No progress on Done/Errors for ~$((stall_cycles * sleep_s))s while status=$status. Console: SSM → Run Command → $id ($reg). Common causes: instance role cannot s3:GetObject/PutObject on discovery bucket, missing jq, or aws:runShellScript timeout."
+            dump_non_success_ssm_invocations "$id" "$reg"
+        fi
+
         case "$status" in
             "Success")
                 if [[ "${targets:-0}" == "0" ]]; then
@@ -374,10 +395,11 @@ wait_ssm() {
         esac
         
         if [[ $(( $(date +%s) - start )) -ge $limit ]]; then
-            err "SSM timeout after ${timeout}m"
+            err "SSM timeout after ${timeout}m (command $id may still be InProgress in console)"
+            dump_non_success_ssm_invocations "$id" "$reg"
             return 1
         fi
-        sleep 10
+        sleep "$sleep_s"
     done
 }
 
